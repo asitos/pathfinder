@@ -40,20 +40,26 @@ const int WEIGHT[NUM_SENSORS] = {
 int calMin[NUM_SENSORS];
 int calMax[NUM_SENSORS];
 
-// ── PID TUNING ───────────────────────────────────────────────────────────────
-float Kp = 0.55;  // Stronger cornering authority for 90° bends
-float Ki = 0.0;
-float Kd = 2.2;  // Higher damping to prevent oscillation
+// ── PID TUNING (MIXED TRACK: ZIG-ZAG + LOOPS + SERPENTINE) ──────────────────
+// Track segments (START→END):
+//   1. Tight zig-zag column (~110–130°, short straights)
+//   2. Figure-8 crossing (junction passthrough)
+//   3. Rounded rectangle loop (moderate curves)
+//   4. Wide serpentine U-turns (slow sweeping 180°)
+// Kp/Kd balanced for zig-zag authority WITHOUT serpentine oscillation.
+float Kp = 0.50;  // Enough pivot authority for 110° apexes; won't resonance-oscillate on wide sweeps
+float Ki = 0.0;   // Zero integral — no lag on rapid zig-zag direction reversals
+float Kd = 1.2;   // Damps apex exit overshoot; settles on serpentine long straights
 
-// ── SPEED LIMITS (90° CORNER & PIVOT READY) ──────────────────────────────────
-#define BASE_SPEED 165  // Controlled cruise
-#define MAX_SPEED 255   // Full battery voltage to outer wheel for maximum turn torque
-#define MIN_SPEED -200  // Hard reverse on inner wheel (counter-rotation tank torque)
-#define TURN_SPEED 200  // High torque pivot spin when line is lost
+// ── SPEED LIMITS ─────────────────────────────────────────────────────────────
+#define BASE_SPEED 185  // Conservative cruise; short zig-zag links leave no room for momentum bleed
+#define MAX_SPEED 255   // Outer wheel drive; sufficient for all turn types
+#define MIN_SPEED -255  // Controlled inner-wheel reverse; handles 110° zig-zag without over-spin
+#define TURN_SPEED 255  // Recovery pivot at junction exits and lost-line at zig-zag apexes
 
 // ── JUNCTION DETECTION ───────────────────────────────────────────────────────
 // If this many sensors or more are ON simultaneously → junction / loop entry.
-#define JUNCTION_THRESHOLD 10
+#define JUNCTION_THRESHOLD 7
 
 // ── STATE ────────────────────────────────────────────────────────────────────
 float lastError = 0;
