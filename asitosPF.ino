@@ -27,45 +27,95 @@
 #define NUM_SENSORS 16
 
 // Lateral weights in tenths-of-mm from robot centerline.
-// Derived from V-shape geometry: 65° inner angle, 32.5° half-angle, 5mm pitch.
-// C0  = Left outermost | C7  = Left innermost
-// C8  = Right innermost| C15 = Right outermost
-// Adjust sign if your boards are physically mirrored.
+// Forward-pointing Arrowhead (^) V-array:
+//   Center sensors (C7, C8) = Apex (20cm ahead of drive axle)
+//   Wing tip sensors (C0, C15) = Swept-back tips (15cm ahead of drive axle, 5cm back from apex)
+//   Inner angle = 65°–70°
+// C0  = Left outermost | C7  = Left innermost (Apex)
+// C8  = Right innermost (Apex)| C15 = Right outermost
 const int WEIGHT[NUM_SENSORS] = {
-  -188, -161, -134, -107, -81, -54, -27, -5,  // C0–C7  left wing
-  5, 27, 54, 81, 107, 134, 161, 188           // C8–C15 right wing
+  -188, -161, -134, -107, -81, -54, -27, -5,  // C0–C7  left wing (swept back from apex)
+  5, 27, 54, 81, 107, 134, 161, 188           // C8–C15 right wing (swept back from apex)
 };
 
 // ── CALIBRATION STORAGE ───────────────────────────────────────────────────────
 int calMin[NUM_SENSORS];
 int calMax[NUM_SENSORS];
 
-// ── PID TUNING (MIXED TRACK: ZIG-ZAG + LOOPS + SERPENTINE) ──────────────────
-// Track segments (START→END):
-//   1. Tight zig-zag column (~110–130°, short straights)
-//   2. Figure-8 crossing (junction passthrough)
-//   3. Rounded rectangle loop (moderate curves)
-//   4. Wide serpentine U-turns (slow sweeping 180°)
-// Kp/Kd balanced for zig-zag authority WITHOUT serpentine oscillation.
-float Kp = 0.50;  // Enough pivot authority for 110° apexes; won't resonance-oscillate on wide sweeps
-float Ki = 0.0;   // Zero integral — no lag on rapid zig-zag direction reversals
-float Kd = 1.2;   // Damps apex exit overshoot; settles on serpentine long straights
+// ── PID & SPEED TUNING (Tunable live via Serial Monitor) ─────────────────────
+// Controlled cruise speed prevents overshooting short links in zigzags/loops.
+// Dynamic base speed bleeds to 0 on sharp turns to execute pure in-place pivots.
+float Kp = 0.70;  // Proportional gain (command: p <val>)
+float Ki = 0.0;   // Zero integral: avoids phase lag / overshoot (command: i <val>)
+float Kd = 1.8;   // Damping derivative: stops oscillation (command: d <val>)
 
-// ── SPEED LIMITS ─────────────────────────────────────────────────────────────
-#define BASE_SPEED 185  // Conservative cruise; short zig-zag links leave no room for momentum bleed
-#define MAX_SPEED 255   // Outer wheel drive; sufficient for all turn types
-#define MIN_SPEED -255  // Controlled inner-wheel reverse; handles 110° zig-zag without over-spin
-#define TURN_SPEED 255  // Recovery pivot at junction exits and lost-line at zig-zag apexes
+int baseSpeed = 220;  // Cruise speed on straights (command: s <val>)
+int maxSpeed = 255;   // Maximum wheel forward speed PWM
+int minSpeed = -200;  // Maximum counter-rotation reverse PWM for tank turns
+int turnSpeed = 220;  // Atomic recovery spin PWM (command: t <val>)
 
 // ── JUNCTION DETECTION ───────────────────────────────────────────────────────
-// If this many sensors or more are ON simultaneously → junction / loop entry.
-#define JUNCTION_THRESHOLD 7
+// Only trigger on full perpendicular cross lines (not diagonal acute angle apexes)
+#define JUNCTION_THRESHOLD 12
+
+// ── MOTOR SPEED BALANCE / TRIM ───────────────────────────────────────────────
+// Adjust to equalize wheel speeds if one motor is physically faster/slower.
+// Tunable live via Serial: "l 0.95" or "r 1.0"
+float leftScale = 1.00f;
+float rightScale = 1.00f;
 
 // ── STATE ────────────────────────────────────────────────────────────────────
 float lastError = 0;
 float integral = 0;
-int lastPos = 0;  // last valid weighted position
+int lastPos = 0;         // last valid weighted position (Pololu-style memory)
+int latchedTurnDir = 0;  // +1 = Right, -1 = Left (latched to prevent left-right shaking)
 bool lineWasLeft = false;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LIVE SERIAL COMMAND PARSER
+// Format: letter followed by number (e.g. "p 0.8", "d 2.0", "s 105", "t 190")
+// Send '?' or 'h' to print current configuration.
+// ─────────────────────────────────────────────────────────────────────────────
+void checkSerialCommands() {
+  if (!Serial.available()) return;
+  char cmd = Serial.read();
+  if (cmd == ' ' || cmd == '\r' || cmd == '\n') return;
+  float val = Serial.parseFloat();
+  switch (cmd) {
+    case 'p':
+    case 'P': Kp = val; break;
+    case 'd':
+    case 'D': Kd = val; break;
+    case 'i':
+    case 'I': Ki = val; break;
+    case 's':
+    case 'S': baseSpeed = (int)val; break;
+    case 't':
+    case 'T': turnSpeed = (int)val; break;
+    case 'l':
+    case 'L': leftScale = val; break;
+    case 'r':
+    case 'R': rightScale = val; break;
+    case '?':
+    case 'h':
+    case 'H': break;
+    default: return;
+  }
+  Serial.print(F("CFG: Kp="));
+  Serial.print(Kp);
+  Serial.print(F(" Kd="));
+  Serial.print(Kd);
+  Serial.print(F(" Ki="));
+  Serial.print(Ki, 4);
+  Serial.print(F(" Base="));
+  Serial.print(baseSpeed);
+  Serial.print(F(" Turn="));
+  Serial.print(turnSpeed);
+  Serial.print(F(" LScale="));
+  Serial.print(leftScale);
+  Serial.print(F(" RScale="));
+  Serial.println(rightScale);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MUX: select channel, short settle, read analog
@@ -104,6 +154,10 @@ void calibrate() {
     }
   }
 
+  // Deadband pause: eliminates reverse back-EMF spike that triggers Brownout Reset
+  setMotors(0, 0);
+  delay(40);
+
   // Step 2: Wide Turn Right (900ms)
   setMotors(SWEEP_SPEED, -SWEEP_SPEED);
   t = millis();
@@ -114,6 +168,9 @@ void calibrate() {
       if (v > calMax[i]) calMax[i] = v;
     }
   }
+
+  setMotors(0, 0);
+  delay(40);
 
   // Step 3: Wide Turn Left (900ms)
   setMotors(-SWEEP_SPEED, SWEEP_SPEED);
@@ -126,6 +183,9 @@ void calibrate() {
     }
   }
 
+  setMotors(0, 0);
+  delay(40);
+
   // Step 4: Wide Turn Right (900ms)
   setMotors(SWEEP_SPEED, -SWEEP_SPEED);
   t = millis();
@@ -136,6 +196,9 @@ void calibrate() {
       if (v > calMax[i]) calMax[i] = v;
     }
   }
+
+  setMotors(0, 0);
+  delay(40);
 
   // Step 5: Return to Center (450ms)
   setMotors(-SWEEP_SPEED, SWEEP_SPEED);
@@ -171,10 +234,10 @@ int readSensors() {
   int count = 0;
   for (int i = 0; i < NUM_SENSORS; i++) {
     int raw = muxRead(i);
-    // Inverted track: White line on Black surface
-    // White line (~calMin) → 1000, Black floor (~calMax) → 0
-    sensorNorm[i] = constrain(map(raw, calMax[i], calMin[i], 0, 1000), 0, 1000);
-    sensorOn[i] = (sensorNorm[i] > 500);
+    // Standard track: Black line on White surface
+    // White floor (~calMin) → 0, Black line (~calMax) → 1000
+    sensorNorm[i] = constrain(map(raw, calMin[i], calMax[i], 0, 1000), 0, 1000);
+    sensorOn[i] = (sensorNorm[i] > 400);  // 400 margin prevents line dropouts on shiny tape
     if (sensorOn[i]) count++;
   }
   return count;
@@ -183,7 +246,7 @@ int readSensors() {
 // ─────────────────────────────────────────────────────────────────────────────
 // WEIGHTED POSITION
 // Returns tenths-of-mm from centre. Positive = line is to the right.
-// Returns 0 if no sensors are on (caller handles lost-line separately).
+// Pololu QTR memory: if line is lost, retains extreme edge instead of false center.
 // ─────────────────────────────────────────────────────────────────────────────
 int computePosition() {
   long wsum = 0;
@@ -194,15 +257,22 @@ int computePosition() {
       total += sensorNorm[i];
     }
   }
-  if (total == 0) return 0;  // caller checks count==0 before calling
-  return (int)(wsum / total);
+  if (total == 0) {
+    return (lastPos >= 0) ? WEIGHT[NUM_SENSORS - 1] : WEIGHT[0];
+  }
+  lastPos = (int)(wsum / total);
+  return lastPos;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MOTOR DRIVER
-// Positive = forward, Negative = reverse, 0 = active short brake.
+// Positive = forward, Negative = reverse, 0 = coast.
+// Applies speed scaling factors to equalize physical motor differences.
 // ─────────────────────────────────────────────────────────────────────────────
 void setMotors(int left, int right) {
+  left = (int)(left * leftScale);
+  right = (int)(right * rightScale);
+
   left = constrain(left, -255, 255);
   right = constrain(right, -255, 255);
 
@@ -214,9 +284,8 @@ void setMotors(int left, int right) {
     digitalWrite(AIN1, LOW);
     digitalWrite(AIN2, HIGH);
   } else {
-    // Active Short Brake (holding torque)
-    digitalWrite(AIN1, HIGH);
-    digitalWrite(AIN2, HIGH);
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
   }
   analogWrite(PWMA, abs(left));
 
@@ -228,9 +297,8 @@ void setMotors(int left, int right) {
     digitalWrite(BIN1, LOW);
     digitalWrite(BIN2, HIGH);
   } else {
-    // Active Short Brake (holding torque)
-    digitalWrite(BIN1, HIGH);
-    digitalWrite(BIN2, HIGH);
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
   }
   analogWrite(PWMB, abs(right));
 }
@@ -288,58 +356,107 @@ void setup() {
   }
 
   Serial.println(F("\n>>> GO! <<<"));
+  Serial.println(F("Live Serial commands: p<val>, d<val>, i<val>, s<baseSpeed>, t<turnSpeed>, l<leftScale>, r<rightScale>, ?"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN LOOP
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
+  checkSerialCommands();
+
   int active = readSensors();
 
-  // ── JUNCTION / LOOP ENTRY ─────────────────────────────────────────────────
-  // Many sensors active at once → wide cross or loop.
-  // Strategy: go straight at reduced speed, reset integrator.
-  if (active >= JUNCTION_THRESHOLD) {
+  // ── JUNCTION / CROSSING DETECTION ─────────────────────────────────────────
+  // A true perpendicular crossing activates BOTH the far-left and far-right wings.
+  // Diagonal acute angles or 90° corners only light up one side.
+  bool leftWingActive = (sensorOn[0] || sensorOn[1] || sensorOn[2]);
+  bool rightWingActive = (sensorOn[13] || sensorOn[14] || sensorOn[15]);
+  if (active >= JUNCTION_THRESHOLD && leftWingActive && rightWingActive) {
     integral = 0;
     lastError = 0;
-    setMotors(BASE_SPEED, BASE_SPEED);
+    setMotors(baseSpeed, baseSpeed);
     return;
   }
 
-  // ── LOST LINE ─────────────────────────────────────────────────────────────
+  // ── ATOMIC LOST-LINE RECOVERY (ESP32-STYLE WITH 20CM NOSE PULL-BACK) ─────
   if (active == 0) {
-    // Spin toward the side the line was last seen on.
-    if (lastPos > 0)
-      setMotors(TURN_SPEED, -TURN_SPEED);  // spin right
-    else
-      setMotors(-TURN_SPEED, TURN_SPEED);  // spin left
+    // Step 1: Brief straight-back pulse (45ms)
+    // Pulls 20cm nose back ~2cm toward vertex so in-place spin stays on tape
+    setMotors(-160, -160);
+    delay(45);
+
+    // Step 2: Atomic recovery spin (like ESP32 while loop) in direction of last seen line
+    int spinLeft = (latchedTurnDir >= 0) ? turnSpeed : -turnSpeed;
+    int spinRight = (latchedTurnDir >= 0) ? -turnSpeed : turnSpeed;
+    setMotors(spinLeft, spinRight);
+
+    // Tight spin loop until line is re-acquired (zero state-machine jitter)
+    while (readSensors() == 0) {
+      // spinning in place
+    }
+
+    // Step 3: Corner alignment lock
+    // Continue in-place spin until line swings toward center (|pos| <= 55)
+    // Ensures heading is aligned with the new path before driving forward
+    unsigned long alignStart = millis();
+    while (millis() - alignStart < 150) {
+      readSensors();
+      int p = computePosition();
+      if (abs(p) <= 55) break;
+      setMotors(spinLeft, spinRight);
+    }
+
+    // Re-acquired & aligned! Re-arm PID without derivative kick
+    lastError = (float)lastPos;
+    integral = 0;
     return;
   }
 
-  // ── NORMAL TRACKING — PID ─────────────────────────────────────────────────
   int pos = computePosition();
-  lastPos = pos;
+
+  // Latch turn direction: remember which side line was on
+  if (pos > 15) latchedTurnDir = 1;         // Line to right
+  else if (pos < -15) latchedTurnDir = -1;  // Line to left
 
   float error = (float)pos;
 
-  integral += error;
-  integral = constrain(integral, -8000.0f, 8000.0f);  // anti-windup
+  // Smooth 1st-order filter eliminates photodiode edge-jitter on angled lines
+  float smoothError = 0.75f * error + 0.25f * lastError;
 
-  float derivative = error - lastError;
-  lastError = error;
+  integral += smoothError;
+  integral = constrain(integral, -4000.0f, 4000.0f);  // anti-windup
 
-  float correction = Kp * error + Ki * integral + Kd * derivative;
+  float derivative = smoothError - lastError;
+  lastError = smoothError;
 
-  int leftSpeed = (int)(BASE_SPEED + correction);
-  int rightSpeed = (int)(BASE_SPEED - correction);
+  float absErr = abs(smoothError);
 
-  leftSpeed = constrain(leftSpeed, MIN_SPEED, MAX_SPEED);
-  rightSpeed = constrain(rightSpeed, MIN_SPEED, MAX_SPEED);
+  // Progressive P-gain: smooth on center, sharp torque boost on tight bends
+  float pTerm = Kp * smoothError;
+  if (absErr > 25.0f) {
+    float excess = absErr - 25.0f;
+    pTerm += (smoothError > 0 ? 1.0f : -1.0f) * (excess * 0.70f);
+  }
+
+  float correction = pTerm + Ki * integral + Kd * derivative;
+
+  // DYNAMIC BASE SPEED:
+  // On straights (absErr < 20): full cruise speed (baseSpeed).
+  // On sharp turns: forward speed smoothly bleeds to 0 as error grows.
+  // When error > 75: base speed drops to 0 so wheels execute a pure in-place
+  // pivot (+180 outer, -180 inner) without driving forward off the corner.
+  int currentBase = baseSpeed;
+  if (absErr > 20.0f) {
+    currentBase = baseSpeed - (int)((absErr - 20.0f) * 1.5f);
+    if (currentBase < 0) currentBase = 0;
+  }
+
+  int leftSpeed = (int)(currentBase + correction);
+  int rightSpeed = (int)(currentBase - correction);
+
+  leftSpeed = constrain(leftSpeed, minSpeed, maxSpeed);
+  rightSpeed = constrain(rightSpeed, minSpeed, maxSpeed);
 
   setMotors(leftSpeed, rightSpeed);
-
-  // ── SERIAL DEBUG (comment out before competition — adds ~2ms latency) ─────
-  // Serial.print(pos); Serial.print('\t');
-  // Serial.print(leftSpeed); Serial.print('\t');
-  // Serial.println(rightSpeed);
 }
