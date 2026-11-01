@@ -29,6 +29,7 @@ the all nighter pulled for this was genuinely fun though, just me in my room wit
 <div align="center">
 
 ![demo race](assets/demoRace.gif)
+
 *autonomous track run speed demo*
 
 ![final look](assets/finalLook.jpg)
