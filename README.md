@@ -30,7 +30,7 @@ the all nighter pulled for this was genuinely fun though, just me in my room wit
 
 ![demo race](assets/demoRace.gif)
 
-*autonomous track run speed demo*
+*autonomous track run speed demo (it got stuck while filming ;-;)*
 
 ![final look](assets/finalLook.jpg)
 *fully assembled and wired robot*
